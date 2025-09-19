@@ -1,4 +1,3 @@
-# app.py
 import os
 import io
 import json
@@ -6,8 +5,13 @@ import time
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
 from PIL import Image, ImageDraw, ImageFont
+
 
 # ============ Page setup ============
 st.set_page_config(page_title="Fight Health & Fatigue HUD", layout="wide")
