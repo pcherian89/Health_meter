@@ -317,7 +317,7 @@ def render_fighter(panel, title, image_path, state_dict, badge_color):
         base = Image.open(image_path).convert("RGBA")
 
     overlayed = draw_heat_overlay(base, state_dict, alpha=120)
-    panel.image(overlayed, use_container_width=True)
+    panel.image(overlayed, use_column_width=True)
 
     # tiny zone readout
     zc1, zc2, zc3 = panel.columns(3)
