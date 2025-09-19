@@ -1,4 +1,4 @@
-# app.py — Simple, stable HUD with per-body-part heat bars (no silhouettes)
+# app.py — Stakeholder-stable HUD with two-tank fatigue (acute + residual)
 import json
 import numpy as np
 import pandas as pd
@@ -13,6 +13,8 @@ st.title("Fight Health & Fatigue HUD (Prototype)")
 
 # ------------------ constants ------------------
 ZONES = ["head","left_arm","right_arm","torso","legs"]
+
+# Action cost = effort on the actor (shoulders/legs/etc)
 DEFAULT_ACTION_COSTS = {
     "jab": {"zone":"right_arm","cost":0.20},
     "cross": {"zone":"right_arm","cost":0.35},
@@ -23,103 +25,143 @@ DEFAULT_ACTION_COSTS = {
     "circle":{"zone":"legs","cost":0.035},
     "clinch":{"zone":"torso","cost":0.25},
 }
+
+# Impact multipliers = load on the recipient
 DEFAULT_IMPACT_COSTS = {"head":1.2,"torso":0.9,"left_arm":0.6,"right_arm":0.6,"legs":0.5}
-DEFAULT_BASE_RECOVERY = {z:0.06 for z in ZONES}
-DEFAULT_REST_RECOVERY = {z:0.12 for z in ZONES}
-DEFAULT_BASE_RATES = {"jab":0.25,"cross":0.10,"hook":0.08,"uppercut":0.05,"advance":0.40,"retreat":0.25,"circle":0.30,"clinch":0.03}
+
+# Action rates (per second baseline before fatigue/round scaling)
+DEFAULT_BASE_RATES = {
+    "jab":0.25,"cross":0.10,"hook":0.08,"uppercut":0.05,
+    "advance":0.40,"retreat":0.25,"circle":0.30,"clinch":0.03
+}
+# Land probabilities & target distribution
 P_LAND = {"jab":0.35,"cross":0.30,"hook":0.28,"uppercut":0.25}
 P_TARGET = {"head":0.6,"torso":0.3,"left_arm":0.05,"right_arm":0.03,"legs":0.02}
+
+# Overall stamina weights
 ZONE_WEIGHTS = {"head":0.20,"left_arm":0.15,"right_arm":0.20,"torso":0.25,"legs":0.20}
 
-# ------------------ helpers ------------------
+# ------------------ two-tank model (logical persistence) ------------------
+# Load is split into: Acute (fast) + Residual (slow). We decay with half-lives.
+ALPHA_IMPACT = 0.7   # fraction of impact into Acute, (1-ALPHA) into Residual
+
+# Half-lives (seconds) – tune these to taste
+HL_ACUTE_ACTIVE = 45.0
+HL_ACUTE_REST   = 20.0
+HL_RESID_ACTIVE = 240.0
+HL_RESID_REST   = 120.0
+
+def half_life_decay(value, dt, half_life):
+    if half_life <= 0:  # safety
+        return max(0.0, value)
+    return value * np.exp(-dt * np.log(2.0) / half_life)
+
 def stamina_from_fatigue(f):
     wf = sum(ZONE_WEIGHTS[z]*f[z] for z in ZONES)
     return max(0.0, 100.0 - wf)
 
 def round_intensity_factor(r: int) -> float:
-    # 1.10 at round 1, then -0.03 per round, clamped to 0.70
+    # Slightly decreasing intensity across rounds (clamped)
     return max(0.70, 1.10 - 0.03*(r-1))
 
+# ------------------ simulator ------------------
 def simulate(rounds=5, round_sec=180, rest_sec=60, hz=5,
              action_costs=None, impact_costs=None,
-             base_recovery=None, rest_recovery=None,
              base_rates=None, seed=42):
     np.random.seed(seed)
-    action_costs   = action_costs   or DEFAULT_ACTION_COSTS
-    impact_costs   = impact_costs   or DEFAULT_IMPACT_COSTS
-    base_recovery  = base_recovery  or DEFAULT_BASE_RECOVERY
-    rest_recovery  = rest_recovery  or DEFAULT_REST_RECOVERY
-    base_rates     = base_rates     or DEFAULT_BASE_RATES
+    action_costs = action_costs or DEFAULT_ACTION_COSTS
+    impact_costs = impact_costs or DEFAULT_IMPACT_COSTS
+    base_rates   = base_rates   or DEFAULT_BASE_RATES
 
-    dt = 1.0/hz
+    dt = 1.0 / hz
     fighters = ["Red","Blue"]
-    fatigue = {f:{z:0.0 for z in ZONES} for f in fighters}
-    rows = []; t = 0.0
+
+    # two-tank state
+    acute   = {f:{z:0.0 for z in ZONES} for f in fighters}
+    resid   = {f:{z:0.0 for z in ZONES} for f in fighters}
+
+    def zval(f,z):  # displayed zone value
+        return min(100.0, acute[f][z] + resid[f][z])
+
+    rows = []
+    t = 0.0
     targets, p_targets = list(P_TARGET.keys()), list(P_TARGET.values())
 
     for r in range(1, rounds+1):
         intensity = round_intensity_factor(r)
-        # Active
+
+        # -------- Active phase --------
         for _ in range(int(round_sec*hz)):
             t += dt
             for f in fighters:
                 opp = "Blue" if f=="Red" else "Red"
-                ov = stamina_from_fatigue(fatigue[f])
+
+                # fatigue → lower work rate
+                ov = stamina_from_fatigue({z: zval(f,z) for z in ZONES})
                 rate_scale = max(0.25, 1 - 0.5*((100-ov)/100)) * intensity
 
+                # stochastic actions
                 events = []
                 for ev, lam in base_rates.items():
-                    if np.random.rand() < lam*rate_scale*dt:
+                    if np.random.rand() < lam * rate_scale * dt:
                         events.append(ev)
 
                 for ev in events:
+                    # Actor pays action cost to the relevant zone (effort → shoulders/legs)
                     info = action_costs[ev]
-                    fatigue[f][info["zone"]] = min(100.0, fatigue[f][info["zone"]] + info["cost"])
+                    z = info["zone"]
+                    acute[f][z] = min(100.0, acute[f][z] + ALPHA_IMPACT*info["cost"])
+                    resid[f][z] = min(100.0, resid[f][z] + (1-ALPHA_IMPACT)*info["cost"])
 
                     landed, target, force = None, None, None
+                    # If it's a punch and it lands, recipient gets impact on the hit zone
                     if ev in ["jab","cross","hook","uppercut"]:
                         if np.random.rand() < P_LAND[ev]:
                             target = np.random.choice(targets, p=p_targets)
                             force  = float(np.clip(np.random.normal(0.6,0.2), 0.05, 1.0))
-                            fatigue[opp][target] = min(100.0, fatigue[opp][target] + impact_costs[target]*force)
+                            impact = impact_costs[target] * force
+                            acute[opp][target] = min(100.0, acute[opp][target] + ALPHA_IMPACT*impact)
+                            resid[opp][target] = min(100.0, resid[opp][target] + (1-ALPHA_IMPACT)*impact)
                             landed = 1
                         else:
                             landed = 0
 
                     rows.append({
-                        "t":t,"round":r,"phase":"active","actor":f,"opponent":opp,"event":ev,
-                        "landed":landed,"target":target,"force":force,
-                        **{f"Red_{z}_fatigue":fatigue['Red'][z] for z in ZONES},
-                        **{f"Blue_{z}_fatigue":fatigue['Blue'][z] for z in ZONES},
-                        "Red_stamina": stamina_from_fatigue(fatigue["Red"]),
-                        "Blue_stamina": stamina_from_fatigue(fatigue["Blue"]),
+                        "t": t, "round": r, "phase": "active", "actor": f, "opponent": opp,
+                        "event": ev, "landed": landed, "target": target, "force": force,
+                        **{f"Red_{zz}_fatigue": zval('Red', zz) for zz in ZONES},
+                        **{f"Blue_{zz}_fatigue": zval('Blue', zz) for zz in ZONES},
+                        "Red_stamina": stamina_from_fatigue({z: zval('Red', z) for z in ZONES}),
+                        "Blue_stamina": stamina_from_fatigue({z: zval('Blue', z) for z in ZONES}),
                     })
-                # Recover during active
+
+                # continuous decay (half-life) during active
                 for z in ZONES:
-                    fatigue[f][z] = max(0.0, fatigue[f][z] - base_recovery[z]*dt)
-        # Rest
+                    acute[f][z] = half_life_decay(acute[f][z], dt, HL_ACUTE_ACTIVE)
+                    resid[f][z] = half_life_decay(resid[f][z], dt, HL_RESID_ACTIVE)
+
+        # -------- Rest phase (between rounds) --------
         if r < rounds:
             for i in range(int(rest_sec*hz)):
                 t += dt
                 for f in fighters:
                     for z in ZONES:
-                        fatigue[f][z] = max(0.0, fatigue[f][z] - rest_recovery[z]*dt)
+                        acute[f][z] = half_life_decay(acute[f][z], dt, HL_ACUTE_REST)
+                        resid[f][z] = half_life_decay(resid[f][z], dt, HL_RESID_REST)
                 if i % hz == 0:  # sparse logging
                     rows.append({
-                        "t":t,"round":r,"phase":"rest","actor":None,"opponent":None,"event":"rest",
-                        "landed":None,"target":None,"force":None,
-                        **{f"Red_{z}_fatigue":fatigue['Red'][z] for z in ZONES},
-                        **{f"Blue_{z}_fatigue":fatigue['Blue'][z] for z in ZONES},
-                        "Red_stamina": stamina_from_fatigue(fatigue["Red"]),
-                        "Blue_stamina": stamina_from_fatigue(fatigue["Blue"]),
+                        "t": t, "round": r, "phase": "rest", "actor": None, "opponent": None,
+                        "event": "rest", "landed": None, "target": None, "force": None,
+                        **{f"Red_{zz}_fatigue": zval('Red', zz) for zz in ZONES},
+                        **{f"Blue_{zz}_fatigue": zval('Blue', zz) for zz in ZONES},
+                        "Red_stamina": stamina_from_fatigue({z: zval('Red', z) for z in ZONES}),
+                        "Blue_stamina": stamina_from_fatigue({z: zval('Blue', z) for z in ZONES}),
                     })
     return pd.DataFrame(rows)
 
-def current_frame(df: pd.DataFrame, t: float) -> pd.Series:
-    return df.iloc[int((df["t"] - t).abs().argmin())]
-
+# ------------------ visuals ------------------
 def color_from_fatigue(v: float, intensity: float = 1.0):
-    # 0->green, 100->red; intensity boosts perceived level
+    # 0→green, 100→red; intensity boosts perceived level (display only)
     v = float(np.clip(v*intensity, 0, 100)) / 100.0
     r = min(1.0, 2.0*v)
     g = min(1.0, 2.0*(1.0 - v))
@@ -141,14 +183,11 @@ def body_heat_panel(ax, title: str, fatigue_dict: dict, intensity: float):
 
 # ------------------ sidebar ------------------
 st.sidebar.header("Simulation Controls")
-rounds    = st.sidebar.slider("Rounds", 1, 12, 5)
+seed      = st.sidebar.number_input("Random seed", value=7, step=1)
+rounds    = st.sidebar.slider("Rounds", 1, 20, 5)
 round_sec = st.sidebar.slider("Round length (sec)", 60, 240, 180, 10)
 rest_sec  = st.sidebar.slider("Rest length (sec)", 0, 120, 60, 5)
 hz        = st.sidebar.slider("Sampling rate (Hz)", 1, 20, 5)
-
-st.sidebar.subheader("Recovery")
-base_rec  = st.sidebar.slider("Active recovery (/s)", 0.00, 0.20, 0.06, 0.005)
-rest_rec  = st.sidebar.slider("Rest recovery (/s)", 0.00, 0.30, 0.12, 0.005)
 
 st.sidebar.subheader("Impact multipliers")
 head_imp  = st.sidebar.slider("Head impact",  0.1, 2.0, 1.2, 0.05)
@@ -157,30 +196,24 @@ arm_imp   = st.sidebar.slider("Arm impact",   0.1, 2.0, 0.6, 0.05)
 leg_imp   = st.sidebar.slider("Leg impact",   0.1, 2.0, 0.5, 0.05)
 
 st.sidebar.subheader("Display")
-intensity = st.sidebar.slider("Heat intensity (visual)", 0.5, 3.0, 1.8, 0.1)
+intensity = st.sidebar.slider("Heat intensity (visual)", 0.5, 3.0, 1.6, 0.1)
 
 st.sidebar.subheader("Use CSV instead of simulator (optional)")
 uploaded = st.sidebar.file_uploader("Upload timeline CSV", type=["csv"])
 
 # ------------------ data source ------------------
 @st.cache_data(show_spinner=False)
-def _simulate_cached(params):
-    impact = {"head":params["head"],"torso":params["torso"],
-              "left_arm":params["arm"],"right_arm":params["arm"],"legs":params["leg"]}
-    base_r = {z: params["base_rec"] for z in ZONES}
-    rest_r = {z: params["rest_rec"] for z in ZONES}
-    return simulate(params["rounds"], params["round_sec"], params["rest_sec"], params["hz"],
-                    DEFAULT_ACTION_COSTS, impact, base_r, rest_r)
+def _simulate_cached(_seed, _rounds, _round_sec, _rest_sec, _hz, _head, _torso, _arm, _leg):
+    impact = {"head":_head,"torso":_torso,"left_arm":_arm,"right_arm":_arm,"legs":_leg}
+    return simulate(_rounds, _round_sec, _rest_sec, _hz,
+                    DEFAULT_ACTION_COSTS, impact, DEFAULT_BASE_RATES, seed=_seed)
 
 if uploaded is not None:
     df = pd.read_csv(uploaded)
 else:
-    params = dict(rounds=rounds, round_sec=round_sec, rest_sec=rest_sec, hz=hz,
-                  head=head_imp, torso=torso_imp, arm=arm_imp, leg=leg_imp,
-                  base_rec=base_rec, rest_rec=rest_rec)
-    df = _simulate_cached(params)
+    df = _simulate_cached(seed, rounds, round_sec, rest_sec, hz, head_imp, torso_imp, arm_imp, leg_imp)
 
-# ------------------ playback ------------------
+# ------------------ playback (current-frame logic) ------------------
 if "t" not in st.session_state:
     st.session_state.t = float(df["t"].min())
 
@@ -189,10 +222,12 @@ st.session_state.t = st.slider("Scrub time (s)",
                                float(df["t"].max()),
                                st.session_state.t, 0.2)
 
-# read the CURRENT FRAME (this fixes “stamina not moving”)
+def current_frame(df: pd.DataFrame, t: float) -> pd.Series:
+    return df.iloc[int((df["t"] - t).abs().argmin())]
+
 frame = current_frame(df, st.session_state.t)
 
-# header KPIs from current frame, not last row
+# header KPIs from the current frame
 k1, k2 = st.columns(2)
 with k1:
     st.subheader("Red — Stamina")
@@ -203,7 +238,7 @@ with k2:
     st.metric(label="", value=f"{frame['Blue_stamina']:.1f}")
     st.progress(int(frame["Blue_stamina"]))
 
-# ------------------ body-part heat panels ------------------
+# body-part heat panels
 colL, colR = st.columns(2)
 red_state  = {z: float(frame[f"Red_{z}_fatigue"]) for z in ZONES}
 blue_state = {z: float(frame[f"Blue_{z}_fatigue"]) for z in ZONES}
@@ -220,7 +255,7 @@ with colR:
     body_heat_panel(ax, "", blue_state, intensity)
     st.pyplot(fig, clear_figure=True)
 
-# ------------------ trend chart ------------------
+# trend chart
 st.markdown("---")
 st.subheader("Stamina Over Time")
 d2 = df.copy(); d2["t_sec"] = d2["t"].round().astype(int)
@@ -228,19 +263,26 @@ grp = d2.groupby("t_sec").agg({"Red_stamina":"mean","Blue_stamina":"mean"}).rese
 fig, ax = plt.subplots(figsize=(10, 4))
 ax.plot(grp["t_sec"], grp["Red_stamina"], label="Red")
 ax.plot(grp["t_sec"], grp["Blue_stamina"], label="Blue")
-ax.set_xlabel("Time (s)"); ax.set_ylabel("Overall Stamina"); ax.grid(True, alpha=.25); ax.legend()
+ax.set_xlabel("Time (s)"); ax.set_ylabel("Overall Stamina")
+ax.grid(True, alpha=.25); ax.legend()
 st.pyplot(fig, clear_figure=True)
 
-# ------------------ export ------------------
+# export
 with st.expander("Data & Export"):
     st.dataframe(df.tail(200), use_container_width=True, height=320)
     st.download_button("Download timeline CSV", df.to_csv(index=False).encode(),
                        "sim_fight_timeline.csv", "text/csv")
     preset = {
+        "seed": seed,
         "rounds": rounds, "round_length_sec": round_sec, "rest_length_sec": rest_sec, "hz": hz,
         "impact_costs": {"head": head_imp, "torso": torso_imp, "arm": arm_imp, "leg": leg_imp},
-        "recovery": {"active_per_sec": base_rec, "rest_per_sec": rest_rec},
+        "model": {
+            "two_tank": True, "alpha_impact": ALPHA_IMPACT,
+            "half_life_sec": {
+                "acute_active": HL_ACUTE_ACTIVE, "acute_rest": HL_ACUTE_REST,
+                "resid_active": HL_RESID_ACTIVE, "resid_rest": HL_RESID_REST
+            }
+        }
     }
     st.download_button("Download preset JSON", json.dumps(preset, indent=2).encode(),
                        "hud_preset.json", "application/json")
-
