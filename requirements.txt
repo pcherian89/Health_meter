@@ -1,14 +1,10 @@
-# keep build tools modern so pip doesn't try to build from source
-pip>=24.2
-setuptools>=75.1
-wheel>=0.44
-
 # libs with cp313 wheels
 numpy==2.2.1
 pandas==2.2.3
-matplotlib==3.9.0
+matplotlib==3.9.2
 Pillow==10.4.0
-streamlit==1.36.0
+streamlit==1.38.0
+
 
 
 
